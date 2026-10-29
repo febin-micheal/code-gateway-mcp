@@ -26,17 +26,33 @@ affiliated with Cloudflare or Anthropic.
 chat (MCP client)  --bearer-->  code-gateway  --MCP-->  your connector A
                                    |  ^                  your connector B
                        pipe only   v  |                  ...
-                              [ bubblewrap sandbox: node, no network, no host files ]
+                              [ sandbox: node, no network, no host files ]
 ```
 
-1. `run_code` starts `node runner.js` inside [bubblewrap](https://github.com/containers/bubblewrap) with `--unshare-all` (no network, new PID/user/IPC namespaces), a read-only `/usr`, an empty `/tmp`, and a clean environment.
+1. `run_code` starts `node runner.js` inside a sandbox (see [Sandbox backends](#sandbox-backends)): no network, no access to the host's files, a memory cap, a clean environment.
 2. The script talks to the gateway only through stdin/stdout. When it calls `api.x.y(...)`, the gateway makes the real call, with the right token, and sends the result back.
 3. Each script has a time limit, a call limit and an output cap. Every call is logged.
+4. **At start-up the gateway tests its own sandbox** (can a script see the home folder, the config, the token, the gateway, or the internet?). If any answer is yes, it refuses to start. So a backend that does not work on your machine fails closed instead of running scripts unprotected.
+
+## Sandbox backends
+
+| Backend | Systems | Needs | Tested |
+|---|---|---|---|
+| `bwrap` ([bubblewrap](https://github.com/containers/bubblewrap)) | Linux | `bwrap`, `node` 18+ | Yes. Ubuntu x86_64 (Node 22) and Debian arm64 (Node 18). All checks pass. |
+| `container` | Linux, macOS, Windows | Docker or Podman (the image `docker.io/library/node:22-alpine` is pulled on first use) | Podman 4.3 (rootless) on Debian arm64: all checks pass. Docker uses the same options but was **not** tested. |
+| `sandbox-exec` | macOS | `node` 18+ (22.3+ to run `tests/test_sandbox.py`) | **Not tested on a real Mac.** The start-up self-test is the safety net: if it leaks, the gateway will not start. |
+| Windows | Windows | WSL2 (then it is the Linux backend), or Docker/Podman Desktop (container backend) | **Not tested.** There is no native Windows backend. |
+
+By default (`"sandbox": "auto"`) the gateway uses the first available one in the order above. To force one, set `"sandbox"` in the config to `bwrap`, `sandbox-exec` or `container`. For the container backend you can also set `container_engine` (`docker` or `podman`; default: Podman if found, else Docker) and `container_image`.
+
+The container backend runs `--network none --read-only --cap-drop ALL --security-opt no-new-privileges`, mounts nothing, limits memory and process count, and runs as an unprivileged user. The first start pulls the image, so it takes longer.
+
+If you try a backend on a system listed as untested, run `python3 tests/test_sandbox.py <port>` against it and please open an issue or PR with the result.
 
 ## Requirements
 
-- Linux with `bwrap` (bubblewrap) and user namespaces enabled
-- Python 3.8+ (standard library only) and Node.js 18+
+- Python 3.8+ (standard library only)
+- One sandbox backend from the table above, and `node` on the host for `bwrap` and `sandbox-exec` (not needed for `container`)
 - Your MCP servers must speak streamable HTTP (JSON or event-stream replies both work)
 
 ## Setup
@@ -61,6 +77,7 @@ Anything without that header gets `401`. The gateway listens on loopback by defa
 {
   "listen": "127.0.0.1:8790",
   "token_file": "~/.config/code-gateway/secret",
+  "sandbox": "auto",
   "connectors": {
     "tickets": { "url": "http://127.0.0.1:9002/mcp", "bearer_file": "~/.config/tickets-mcp/token" },
     "chat":    { "url": "http://127.0.0.1:9003/mcp", "bearer_env_file": "~/.config/chat-mcp/env", "bearer_env_key": "CHAT_MCP_TOKEN" },
@@ -91,9 +108,9 @@ Tool results are parsed for you: JSON text becomes an object, other text stays a
 ## Things to know
 
 - **Approvals collapse.** Your chat app asks to approve `run_code` as a whole, not each inner call. If one of your connectors can do something destructive (send, delete, run shell commands), either leave it out of the config or only add it when you are happy for scripts to use it. Every inner call is written to the log file (connector, tool, first 200 characters of the arguments, result, time).
-- **The sandbox is the safety layer.** Check it with `python3 tests/test_sandbox.py <port>`: it confirms there is no internet, no host files, no way back to the gateway, a working time limit, and clear errors.
+- **The sandbox is the safety layer.** The gateway checks it at start-up, and you can re-check a running one with `python3 tests/test_sandbox.py <port>`: no internet, no host files, no way back to the gateway, a working time limit, and clear errors.
 - **No internet from scripts by design.** If a script needs a web page, give it a connector that fetches pages.
-- Linux only. It was written for a small home setup, not hardened for hostile multi-user hosting.
+- It was written for a small home setup and is not hardened for hostile multi-user hosting. Only the Linux backends have been tested (see above).
 
 ## License
 

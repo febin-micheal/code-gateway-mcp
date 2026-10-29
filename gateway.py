@@ -7,7 +7,8 @@ Instead of showing a model hundreds of tools, it shows two:
               calls the other servers through `api.<connector>.<tool>(input)`
               and only its printed output / return value comes back.
 
-Standard library only (Python 3.8+). The sandbox needs `bwrap` (bubblewrap) and `node`.
+Standard library only (Python 3.8+). The sandbox needs `node` plus one backend: bwrap (Linux),
+sandbox-exec (macOS) or Docker/Podman (any OS). See README.
 """
 import hmac
 import json
@@ -16,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -25,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib import error as urlerror, request as urlrequest
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 HERE = Path(__file__).resolve().parent
 RUNNER = HERE / "runner.js"
 CONFIG_PATH = Path(os.environ.get("CODE_GATEWAY_CONFIG", "~/.config/code-gateway/config.json")).expanduser()
@@ -379,40 +381,156 @@ def list_api(args):
     return "\n".join(lines)
 
 
-# --------------------------------------------------------------------------- sandbox
+# --------------------------------------------------------------------------- sandboxes
+#
+# A sandbox backend starts `node` running runner.js with: no network, no access to the host's files
+# (home folder, tokens, config), a memory cap, and only stdin/stdout to talk to the gateway.
+# Backends: bwrap (Linux), sandbox-exec (macOS), container (Docker or Podman, any OS).
+# Whatever backend is chosen, the gateway runs a self-test at startup and refuses to start if it fails.
 
-def sandbox_cmd(node):
-    cmd = ["bwrap", "--unshare-all", "--die-with-parent", "--new-session", "--clearenv",
-           "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "HOME", "/tmp",
-           "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--ro-bind", "/usr", "/usr"]
-    for d in ("/bin", "/sbin", "/lib", "/lib64", "/lib32"):
-        if os.path.islink(d):
-            cmd += ["--symlink", os.readlink(d), d]
-        elif os.path.isdir(d):
-            cmd += ["--ro-bind", d, d]
-    if os.path.exists("/etc/ld.so.cache"):
-        cmd += ["--ro-bind", "/etc/ld.so.cache", "/etc/ld.so.cache"]
-    real = os.path.realpath(node)
-    if not real.startswith("/usr/"):
-        prefix = str(Path(real).parent.parent)
-        cmd += ["--ro-bind", prefix, prefix]
-    cmd += ["--ro-bind", str(RUNNER), "/sandbox/runner.js", "--chdir", "/tmp",
-            real, f"--max-old-space-size={int(LIMITS['memory_mb'])}", "/sandbox/runner.js"]
-    return cmd
+RUNNER_SRC = RUNNER.read_text()
+MEM = int(LIMITS["memory_mb"])
+POSIX = os.name == "posix"
+CONTAINER_IMAGE = CFG.get("container_image", "docker.io/library/node:22-alpine")
+CONTAINER_ENGINE = CFG.get("container_engine", "auto")  # docker | podman | auto
 
 
-def run_code(args):
-    code = args.get("code")
-    if not isinstance(code, str) or not code.strip():
-        raise BackendError("`code` is required")
-    timeout_s = min(int(args.get("timeout_s") or LIMITS["timeout_s"]), int(LIMITS["max_timeout_s"]))
-    node = shutil.which("node")
-    if not node or not shutil.which("bwrap"):
-        raise BackendError("sandbox unavailable: node and bwrap must be installed")
+class Sandbox:
+    name = "?"
+
+    def available(self):
+        raise NotImplementedError
+
+    def prepare(self, run_id):
+        """Return (command, env, cleanup). env=None means inherit the gateway's environment."""
+        raise NotImplementedError
+
+    def kill(self, proc, run_id):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+class Bwrap(Sandbox):
+    """Linux: bubblewrap with every namespace unshared, read-only /usr, empty /tmp, clean environment."""
+    name = "bwrap"
+
+    def available(self):
+        return sys.platform.startswith("linux") and bool(shutil.which("bwrap")) and bool(shutil.which("node"))
+
+    def prepare(self, run_id):
+        node = os.path.realpath(shutil.which("node"))
+        cmd = ["bwrap", "--unshare-all", "--die-with-parent", "--new-session", "--clearenv",
+               "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "HOME", "/tmp",
+               "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--ro-bind", "/usr", "/usr"]
+        for d in ("/bin", "/sbin", "/lib", "/lib64", "/lib32"):
+            if os.path.islink(d):
+                cmd += ["--symlink", os.readlink(d), d]
+            elif os.path.isdir(d):
+                cmd += ["--ro-bind", d, d]
+        if os.path.exists("/etc/ld.so.cache"):
+            cmd += ["--ro-bind", "/etc/ld.so.cache", "/etc/ld.so.cache"]
+        if not node.startswith("/usr/"):
+            prefix = str(Path(node).parent.parent)
+            cmd += ["--ro-bind", prefix, prefix]
+        cmd += ["--ro-bind", str(RUNNER), "/sandbox/runner.js", "--chdir", "/tmp",
+                node, f"--max-old-space-size={MEM}", "/sandbox/runner.js"]
+        return cmd, None, (lambda: None)
+
+
+def _sbpl(s):
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+class SandboxExec(Sandbox):
+    """macOS: Seatbelt via sandbox-exec. NOT tested on a real Mac by the author; the start-up self-test is the guard."""
+    name = "sandbox-exec"
+
+    def available(self):
+        return sys.platform == "darwin" and bool(shutil.which("sandbox-exec")) and bool(shutil.which("node"))
+
+    def prepare(self, run_id):
+        node = os.path.realpath(shutil.which("node"))
+        home = os.path.realpath(os.path.expanduser("~"))
+        tmp = os.path.realpath(tempfile.mkdtemp(prefix="code-gw-"))
+        prefix = str(Path(node).parent.parent)
+        profile = "\n".join([
+            "(version 1)",
+            "(allow default)",
+            "(deny network*)",
+            "(deny file-write*)",
+            f'(allow file-write* (subpath "{_sbpl(tmp)}") (literal "/dev/null") (literal "/dev/dtracehelper"))',
+            f'(deny file-read-data (subpath "{_sbpl(home)}") (subpath "/Users") (subpath "/Volumes"))',
+            f'(allow file-read-data (subpath "{_sbpl(prefix)}") (subpath "{_sbpl(tmp)}"))',
+        ])
+        pf = os.path.join(tmp, "profile.sb")
+        Path(pf).write_text(profile)
+        cmd = ["sandbox-exec", "-f", pf, node, f"--max-old-space-size={MEM}", "-e", RUNNER_SRC]
+        env = {"PATH": "/usr/bin:/bin", "HOME": tmp, "TMPDIR": tmp}
+        return cmd, env, (lambda: shutil.rmtree(tmp, ignore_errors=True))
+
+
+class Container(Sandbox):
+    """Any OS with Docker or Podman: no network, read-only root, no mounts, all capabilities dropped."""
+    name = "container"
+
+    def engine(self):
+        if CONTAINER_ENGINE != "auto":
+            return shutil.which(CONTAINER_ENGINE)
+        return shutil.which("podman") or shutil.which("docker")
+
+    def available(self):
+        return bool(self.engine())
+
+    def prepare(self, run_id):
+        name = f"code-gw-{run_id}"
+        cmd = [self.engine(), "run", "--rm", "-i", "--name", name, "--network", "none", "--read-only",
+               "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "128",
+               "--memory", f"{MEM + 128}m", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+               "--user", "65534:65534", CONTAINER_IMAGE,
+               "node", f"--max-old-space-size={MEM}", "-e", RUNNER_SRC]
+        return cmd, None, (lambda: None)
+
+    def kill(self, proc, run_id):
+        try:
+            subprocess.run([self.engine(), "kill", f"code-gw-{run_id}"], timeout=10,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+BACKENDS_ORDER = [Bwrap(), SandboxExec(), Container()]
+SANDBOX = None
+
+
+def pick_sandbox():
+    want = CFG.get("sandbox", "auto")
+    if want != "auto":
+        sb = next((s for s in BACKENDS_ORDER if s.name == want), None)
+        if sb is None or not sb.available():
+            raise SystemExit(f"sandbox '{want}' is not available on this machine "
+                             f"(choices: {', '.join(s.name for s in BACKENDS_ORDER)})")
+        return sb
+    for s in BACKENDS_ORDER:
+        if s.available():
+            return s
+    raise SystemExit("no sandbox available. Install bubblewrap (Linux), use macOS sandbox-exec, "
+                     "or install Docker or Podman and set \"sandbox\": \"container\".")
+
+
+def execute(sb, code, timeout_s, selftest=False):
+    """Run one script in the sandbox. Returns a dict with logs, the final message, call count and timing."""
     run_id = uuid.uuid4().hex[:8]
     t0 = time.time()
-    proc = subprocess.Popen(sandbox_cmd(node), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, bufsize=1, start_new_session=True)
+    cmd, env, cleanup = sb.prepare(run_id)
+    kw = {"start_new_session": True} if POSIX else {}
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace", bufsize=1, env=env, **kw)
     stdin_lock, state_lock = threading.Lock(), threading.Lock()
     logs, stderr_buf = [], []
     st = {"calls": 0, "done": None, "timed_out": False}
@@ -427,10 +545,7 @@ def run_code(args):
 
     def on_timeout():
         st["timed_out"] = True
-        try:
-            proc.kill()
-        except OSError:
-            pass
+        sb.kill(proc, run_id)
 
     timer = threading.Timer(timeout_s, on_timeout)
     timer.start()
@@ -458,38 +573,78 @@ def run_code(args):
                    "ms": int((time.time() - t) * 1000), "args": json.dumps(a, ensure_ascii=False)[:200],
                    **({"error": err[:200]} if err else {})})
 
-    send({"type": "run", "code": code, "connectors": list(BACKENDS)})
-    for line in proc.stdout:
-        line = line.rstrip("\n")
-        try:
-            msg = json.loads(line)
-        except ValueError:
-            logs.append(line)
-            continue
-        kind = msg.get("type") if isinstance(msg, dict) else None
-        if kind == "log":
-            logs.append(msg.get("text", ""))
-        elif kind == "call":
-            pool.submit(handle_call, msg)
-        elif kind == "done":
-            st["done"] = msg
-        else:
-            logs.append(line)
-    timer.cancel()
     try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-    pool.shutdown(wait=True)
+        send({"type": "run", "code": code, "connectors": list(BACKENDS), "selftest": selftest})
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                logs.append(line)
+                continue
+            kind = msg.get("type") if isinstance(msg, dict) else None
+            if kind == "log":
+                logs.append(msg.get("text", ""))
+            elif kind == "call":
+                pool.submit(handle_call, msg)
+            elif kind == "done":
+                st["done"] = msg
+            else:
+                logs.append(line)
+        timer.cancel()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            sb.kill(proc, run_id)
+        pool.shutdown(wait=True)
+    finally:
+        timer.cancel()
+        cleanup()
+    return {"run": run_id, "logs": logs, "done": st["done"], "timed_out": st["timed_out"], "calls": st["calls"],
+            "ms": int((time.time() - t0) * 1000), "stderr": " ".join(stderr_buf)[:500]}
 
-    parts = list(logs)
+
+def selftest(sb, port):
+    """Start-up check. Returns (ok, detail). The sandbox must hide the home folder, config and token, and block the network."""
+    code = f"""
+const fs = require('fs'), net = require('net');
+const out = {{}};
+const tryRead = (k, fn) => {{ try {{ fn(); out[k] = 'VISIBLE' }} catch (e) {{ out[k] = 'blocked' }} }};
+tryRead('home', () => fs.readdirSync({json.dumps(os.path.expanduser('~'))}));
+tryRead('config', () => fs.readFileSync({json.dumps(str(CONFIG_PATH))}));
+tryRead('token', () => fs.readFileSync({json.dumps(str(TOKEN_FILE))}));
+const conn = (host, p) => new Promise(res => {{
+  const s = net.connect({{ host, port: p }});
+  const t = setTimeout(() => {{ s.destroy(); res('blocked') }}, 3000);
+  s.on('connect', () => {{ clearTimeout(t); s.destroy(); res('CONNECTED') }});
+  s.on('error', () => {{ clearTimeout(t); res('blocked') }});
+}});
+out.gateway = await conn('127.0.0.1', {int(port)});
+out.internet = await conn('1.1.1.1', 443);
+return out;
+"""
+    res = execute(sb, code, int(LIMITS.get("selftest_timeout_s", 180)), selftest=True)
+    done = res["done"]
+    if not done or not done.get("ok"):
+        return False, f"self-test script did not run: {(done or {}).get('error') or res['stderr'] or res['logs']}"
+    bad = {k: v for k, v in (done.get("value") or {}).items() if v != "blocked"}
+    return (not bad and len(done.get("value") or {}) == 5), (f"sandbox leaks: {bad}" if bad else "ok")
+
+
+def run_code(args):
+    code = args.get("code")
+    if not isinstance(code, str) or not code.strip():
+        raise BackendError("`code` is required")
+    timeout_s = min(int(args.get("timeout_s") or LIMITS["timeout_s"]), int(LIMITS["max_timeout_s"]))
+    res = execute(SANDBOX, code, timeout_s)
+    parts = list(res["logs"])
     is_error = False
-    done = st["done"]
-    if st["timed_out"]:
+    done = res["done"]
+    if res["timed_out"]:
         parts.append(f"Error: script stopped after {timeout_s}s (time limit).")
         is_error = True
     elif done is None:
-        parts.append("Error: sandbox exited without a result. " + " ".join(stderr_buf)[:500])
+        parts.append("Error: sandbox exited without a result. " + res["stderr"])
         is_error = True
     elif not done.get("ok"):
         parts.append("Error: " + str(done.get("error", "unknown error")))
@@ -497,14 +652,13 @@ def run_code(args):
     elif done.get("hasValue"):
         v = done.get("value")
         parts.append("→ " + (v if isinstance(v, str) else json.dumps(v, indent=2, ensure_ascii=False)))
-    ms = int((time.time() - t0) * 1000)
     text = "\n".join(parts)
     cap = int(LIMITS["max_output_chars"])
     if len(text) > cap:
         text = text[:cap] + f"\n[output cut: {len(text) - cap} more characters]"
-    text += f"\n[{st['calls']} connector call(s), {ms} ms]"
-    log_event({"event": "run", "run": run_id, "ok": not is_error, "calls": st["calls"], "ms": ms,
-               "code_head": code[:200]})
+    text += f"\n[{res['calls']} connector call(s), {res['ms']} ms]"
+    log_event({"event": "run", "run": res["run"], "ok": not is_error, "calls": res["calls"], "ms": res["ms"],
+               "backend": SANDBOX.name, "code_head": code[:200]})
     return text, is_error
 
 
@@ -609,10 +763,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    global SANDBOX
     host, _, port = CFG.get("listen", "127.0.0.1:8790").rpartition(":")
+    SANDBOX = pick_sandbox()
+    print(f"sandbox backend: {SANDBOX.name}; running self-test...", flush=True)
+    ok, detail = selftest(SANDBOX, port)
+    if not ok:
+        raise SystemExit(f"sandbox self-test FAILED for '{SANDBOX.name}': {detail}. Refusing to start.")
     srv = ThreadingHTTPServer((host or "127.0.0.1", int(port)), Handler)
     srv.daemon_threads = True
-    print(f"code-gateway {VERSION} on {host}:{port}, connectors: {', '.join(BACKENDS)}", flush=True)
+    print(f"code-gateway {VERSION} on {host}:{port}, sandbox: {SANDBOX.name}, connectors: {', '.join(BACKENDS)}", flush=True)
     srv.serve_forever()
 
 

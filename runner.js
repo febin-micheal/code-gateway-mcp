@@ -47,6 +47,7 @@ process.on('uncaughtException', fail);
 
 async function run(msg) {
   try {
+    if (msg.selftest) globalThis.require = require; // only the gateway's own start-up check gets this
     const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
     const fn = new AsyncFunction('api', 'console', msg.code);
     const v = await fn(makeApi(msg.connectors || []), console);

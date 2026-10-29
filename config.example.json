@@ -1,6 +1,7 @@
 {
   "listen": "127.0.0.1:8790",
   "token_file": "~/.config/code-gateway/secret",
+  "sandbox": "auto",
   "log_file": "~/.local/state/code-gateway/calls.log",
   "limits": {
     "timeout_s": 60,
@@ -11,9 +12,21 @@
     "call_timeout_s": 60
   },
   "connectors": {
-    "notes":  { "url": "http://127.0.0.1:9001/mcp" },
-    "tickets": { "url": "http://127.0.0.1:9002/mcp", "bearer_file": "~/.config/tickets-mcp/token" },
-    "chat":   { "url": "http://127.0.0.1:9003/mcp", "bearer_env_file": "~/.config/chat-mcp/env", "bearer_env_key": "CHAT_MCP_TOKEN" },
-    "wiki":   { "url": "http://127.0.0.1:9004/{secret}/mcp", "url_secret_file": "~/.config/wiki-mcp/secret" }
+    "notes": {
+      "url": "http://127.0.0.1:9001/mcp"
+    },
+    "tickets": {
+      "url": "http://127.0.0.1:9002/mcp",
+      "bearer_file": "~/.config/tickets-mcp/token"
+    },
+    "chat": {
+      "url": "http://127.0.0.1:9003/mcp",
+      "bearer_env_file": "~/.config/chat-mcp/env",
+      "bearer_env_key": "CHAT_MCP_TOKEN"
+    },
+    "wiki": {
+      "url": "http://127.0.0.1:9004/{secret}/mcp",
+      "url_secret_file": "~/.config/wiki-mcp/secret"
+    }
   }
 }
